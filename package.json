@@ -1,0 +1,24 @@
+{
+  "name": "crypto-market-mcp",
+  "version": "1.1.0",
+  "description": "MCP-сервер с данными крипторынка (CoinGecko, Fear & Greed Index) и традиционных финансов (Yahoo Finance) без необходимости в API-ключах. Поддерживает stdio (локально, Claude Code) и HTTP (облако, Cowork/claude.ai/Claude Code) транспорты.",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "crypto-market-mcp": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "start:http": "node src/http.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["mcp", "crypto", "coingecko", "market-data"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^5.1.0"
+  }
+}
