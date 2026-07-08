@@ -5,24 +5,53 @@
 
 const COINGECKO_BASE = "https://api.coingecko.com/api/v3";
 const FEAR_GREED_URL = "https://api.alternative.me/fng/";
-const YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote";
+// v8/finance/chart не требует crumb-токена в отличие от v7/finance/quote,
+// который Yahoo в какой-то момент закрыл для анонимных запросов (401).
+const YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart";
 
 // -------------------- Вспомогательные функции --------------------
 
-async function fetchJson(url, options = {}) {
-  const res = await fetch(url, {
-    headers: {
-      Accept: "application/json",
-      "User-Agent": "crypto-market-mcp/1.0",
-      ...options.headers,
-    },
-    ...options,
-  });
+// Простой in-memory кэш с TTL — сглаживает частые повторные запросы к одному
+// и тому же эндпоинту (например, когда market-dashboard дёргает несколько
+// инструментов подряд) и снижает риск упереться в rate limit CoinGecko.
+const cache = new Map(); // url -> { data, expires }
+
+async function fetchJson(url, options = {}, cacheTtlMs = 20_000) {
+  const cached = cache.get(url);
+  if (cached && cached.expires > Date.now()) {
+    return cached.data;
+  }
+
+  const doFetch = async () => {
+    return fetch(url, {
+      headers: {
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0 crypto-market-mcp/1.1",
+        ...options.headers,
+      },
+      ...options,
+    });
+  };
+
+  let res = await doFetch();
+
+  // На 429 (rate limit) делаем одну повторную попытку с небольшой паузой —
+  // часто этого достаточно, чтобы проскочить кратковременный лимит.
+  if (res.status === 429) {
+    await new Promise((r) => setTimeout(r, 1500));
+    res = await doFetch();
+  }
+
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new Error(`Request failed ${res.status} ${res.statusText}: ${url}\n${body.slice(0, 300)}`);
   }
-  return res.json();
+
+  const data = await res.json();
+  if (cacheTtlMs > 0) {
+    cache.set(url, { data, expires: Date.now() + cacheTtlMs });
+  }
+  return data;
 }
 
 function formatNumber(n, digits = 2) {
@@ -165,7 +194,9 @@ async function getMarketMovers({ limit = 10, vs_currency = "usd" }) {
 }
 
 async function getTraditionalMarkets() {
-  // Основные индексы, доходность 10-летних облигаций США, индекс доллара
+  // Основные индексы, доходность 10-летних облигаций США, индекс доллара.
+  // Используем v8/finance/chart по каждому символу отдельно — в отличие от
+  // v7/finance/quote (batch), этот эндпоинт не требует crumb-токена.
   const symbols = ["^GSPC", "^IXIC", "^DJI", "^TNX", "DX-Y.NYB", "GC=F", "CL=F"];
   const labels = {
     "^GSPC": "S&P 500",
@@ -176,23 +207,38 @@ async function getTraditionalMarkets() {
     "GC=F": "Gold Futures",
     "CL=F": "Crude Oil (WTI) Futures",
   };
-  const url = `${YAHOO_QUOTE_URL}?symbols=${symbols
-    .map(encodeURIComponent)
-    .join(",")}`;
-  const data = await fetchJson(url, {
-    headers: { "User-Agent": "Mozilla/5.0 crypto-market-mcp" },
-  });
-  const results = data.quoteResponse?.result || [];
-  return results.map((r) => ({
-    symbol: r.symbol,
-    name: labels[r.symbol] || r.shortName || r.symbol,
-    price: r.regularMarketPrice,
-    change_pct: r.regularMarketChangePercent,
-    change: r.regularMarketChange,
-    updated_at: r.regularMarketTime
-      ? new Date(r.regularMarketTime * 1000).toISOString()
-      : null,
-  }));
+
+  const results = await Promise.all(
+    symbols.map(async (symbol) => {
+      try {
+        const url = `${YAHOO_CHART_URL}/${encodeURIComponent(symbol)}?interval=1d&range=5d`;
+        const data = await fetchJson(url, {}, 60_000); // кэш на минуту, эти данные не сверхбыстрые
+        const meta = data?.chart?.result?.[0]?.meta;
+        if (!meta) return null;
+        const price = meta.regularMarketPrice;
+        const prevClose = meta.previousClose ?? meta.chartPreviousClose;
+        const change = price != null && prevClose != null ? price - prevClose : null;
+        const changePct =
+          change != null && prevClose ? (change / prevClose) * 100 : null;
+        return {
+          symbol,
+          name: labels[symbol] || symbol,
+          price,
+          change_pct: changePct,
+          change,
+          updated_at: meta.regularMarketTime
+            ? new Date(meta.regularMarketTime * 1000).toISOString()
+            : null,
+        };
+      } catch (err) {
+        // Не роняем весь инструмент из-за одного проблемного символа —
+        // отмечаем ошибку по конкретному тикеру и продолжаем.
+        return { symbol, name: labels[symbol] || symbol, error: err.message };
+      }
+    })
+  );
+
+  return results.filter(Boolean);
 }
 
 // -------------------- Определение MCP-сервера --------------------
