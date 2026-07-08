@@ -8,6 +8,10 @@ const FEAR_GREED_URL = "https://api.alternative.me/fng/";
 // v8/finance/chart не требует crumb-токена в отличие от v7/finance/quote,
 // который Yahoo в какой-то момент закрыл для анонимных запросов (401).
 const YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart";
+const DEFILLAMA_BASE = "https://api.llama.fi";
+const DEFILLAMA_STABLECOINS_BASE = "https://stablecoins.llama.fi";
+const DEFILLAMA_YIELDS_BASE = "https://yields.llama.fi";
+const DEXPAPRIKA_BASE = "https://api.dexpaprika.com";
 
 // -------------------- Вспомогательные функции --------------------
 
@@ -241,7 +245,181 @@ async function getTraditionalMarkets() {
   return results.filter(Boolean);
 }
 
-// -------------------- Определение MCP-сервера --------------------
+// -------------------- DeFiLlama --------------------
+
+async function getDefiProtocols({ limit = 20, chain } = {}) {
+  const data = await fetchJson(`${DEFILLAMA_BASE}/protocols`, {}, 60_000);
+  let list = data;
+  if (chain) {
+    list = list.filter((p) =>
+      (p.chains || []).some((c) => c.toLowerCase() === chain.toLowerCase())
+    );
+  }
+  const sorted = [...list].sort((a, b) => (b.tvl || 0) - (a.tvl || 0));
+  return sorted.slice(0, limit).map((p) => ({
+    name: p.name,
+    slug: p.slug,
+    category: p.category,
+    chains: p.chains,
+    tvl_usd: p.tvl,
+    tvl_fmt: "$" + formatNumber(p.tvl),
+    change_1d_pct: p.change_1d,
+    change_7d_pct: p.change_7d,
+  }));
+}
+
+async function getProtocolTvl({ slug }) {
+  const data = await fetchJson(
+    `${DEFILLAMA_BASE}/protocol/${encodeURIComponent(slug)}`,
+    {},
+    60_000
+  );
+  const chainTvls = data.chainTvls
+    ? Object.fromEntries(
+        Object.entries(data.chainTvls)
+          .map(([chain, v]) => [chain, v?.tvl?.at?.(-1)?.totalLiquidityUSD ?? null])
+          .filter(([, v]) => v !== null)
+      )
+    : {};
+  return {
+    name: data.name,
+    slug: data.slug ?? data.id,
+    category: data.category,
+    description: data.description,
+    url: data.url,
+    twitter: data.twitter,
+    chains: data.chains,
+    current_tvl_usd: data.currentChainTvls
+      ? Object.values(data.currentChainTvls).reduce((a, b) => a + b, 0)
+      : null,
+    tvl_by_chain: chainTvls,
+  };
+}
+
+async function getChainTvl({ limit = 20 } = {}) {
+  const data = await fetchJson(`${DEFILLAMA_BASE}/v2/chains`, {}, 60_000);
+  const sorted = [...data].sort((a, b) => (b.tvl || 0) - (a.tvl || 0));
+  return sorted.slice(0, limit).map((c) => ({
+    name: c.name,
+    tvl_usd: c.tvl,
+    tvl_fmt: "$" + formatNumber(c.tvl),
+    token_symbol: c.tokenSymbol,
+  }));
+}
+
+async function getStablecoins({ limit = 15 } = {}) {
+  const data = await fetchJson(
+    `${DEFILLAMA_STABLECOINS_BASE}/stablecoins?includePrices=true`,
+    {},
+    60_000
+  );
+  const list = data.peggedAssets || [];
+  const sorted = [...list].sort(
+    (a, b) =>
+      (b.circulating?.peggedUSD || 0) - (a.circulating?.peggedUSD || 0)
+  );
+  return sorted.slice(0, limit).map((s) => ({
+    name: s.name,
+    symbol: s.symbol,
+    peg_type: s.pegType,
+    circulating_usd: s.circulating?.peggedUSD,
+    circulating_fmt: "$" + formatNumber(s.circulating?.peggedUSD),
+    price: s.price,
+  }));
+}
+
+async function getYieldPools({ limit = 20, chain, project, min_tvl_usd } = {}) {
+  const data = await fetchJson(`${DEFILLAMA_YIELDS_BASE}/pools`, {}, 60_000);
+  let list = data.data || [];
+  if (chain) {
+    list = list.filter((p) => (p.chain || "").toLowerCase() === chain.toLowerCase());
+  }
+  if (project) {
+    list = list.filter((p) =>
+      (p.project || "").toLowerCase().includes(project.toLowerCase())
+    );
+  }
+  if (min_tvl_usd) {
+    list = list.filter((p) => (p.tvlUsd || 0) >= min_tvl_usd);
+  }
+  const sorted = [...list].sort((a, b) => (b.apy || 0) - (a.apy || 0));
+  return sorted.slice(0, limit).map((p) => ({
+    project: p.project,
+    chain: p.chain,
+    symbol: p.symbol,
+    apy_pct: p.apy,
+    apy_base_pct: p.apyBase,
+    apy_reward_pct: p.apyReward,
+    tvl_usd: p.tvlUsd,
+    tvl_fmt: "$" + formatNumber(p.tvlUsd),
+    stablecoin: p.stablecoin,
+    il_risk: p.ilRisk,
+  }));
+}
+
+// -------------------- DexPaprika --------------------
+// Публичный API, без ключей. Начиная с v1.3.0 глобальный /pools убран —
+// все запросы по пулам требуют явного указания сети (network).
+
+async function getDexNetworks() {
+  const data = await fetchJson(`${DEXPAPRIKA_BASE}/networks`, {}, 300_000);
+  return (Array.isArray(data) ? data : data.networks || []).map((n) => ({
+    id: n.id,
+    display_name: n.display_name || n.name,
+  }));
+}
+
+async function getNetworkTopPools({ network, limit = 10, order_by = "volume_usd" }) {
+  const url = `${DEXPAPRIKA_BASE}/networks/${encodeURIComponent(
+    network
+  )}/pools?limit=${limit}&order_by=${encodeURIComponent(order_by)}&sort=desc`;
+  const data = await fetchJson(url, {}, 30_000);
+  const pools = data.pools || data.data || [];
+  return pools.map((p) => ({
+    id: p.id,
+    dex: p.dex_name || p.dex,
+    tokens: (p.tokens || []).map((t) => t.symbol),
+    price_usd: p.price_usd,
+    volume_usd_24h: p.volume_usd,
+    liquidity_usd: p.liquidity_usd ?? p.tvl_usd,
+  }));
+}
+
+async function getTokenInfo({ network, token_address }) {
+  const url = `${DEXPAPRIKA_BASE}/networks/${encodeURIComponent(
+    network
+  )}/tokens/${encodeURIComponent(token_address)}`;
+  const t = await fetchJson(url, {}, 30_000);
+  return {
+    id: t.id,
+    name: t.name,
+    symbol: t.symbol,
+    chain: t.chain,
+    price_usd: t.summary?.price_usd,
+    liquidity_usd: t.summary?.liquidity_usd,
+    fdv_usd: t.summary?.fdv,
+    pools_count: t.summary?.pools,
+    volume_24h_usd: t.summary?.["24h"]?.volume_usd,
+  };
+}
+
+async function searchDex({ query }) {
+  const url = `${DEXPAPRIKA_BASE}/search?query=${encodeURIComponent(query)}`;
+  const data = await fetchJson(url, {}, 30_000);
+  return {
+    tokens: (data.tokens || []).slice(0, 10).map((t) => ({
+      id: t.id,
+      name: t.name,
+      symbol: t.symbol,
+      chain: t.chain,
+    })),
+    pools: (data.pools || []).slice(0, 10).map((p) => ({
+      id: p.id,
+      chain: p.chain,
+      dex: p.dex_name || p.dex,
+    })),
+  };
+}
 
 const TOOLS = [
   {
@@ -335,6 +513,119 @@ const TOOLS = [
       "Данные традиционных финансовых рынков: S&P 500, Nasdaq, Dow Jones, доходность 10-летних гособлигаций США, индекс доллара (DXY), золото и нефть. Полезно для макро-контекста в аналитике и статьях про связь крипты и традиционных рынков.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
+  {
+    name: "get_defi_protocols",
+    description:
+      "Топ DeFi-протоколов по TVL (Total Value Locked) с категорией, сетями и изменением за 1д/7д. Источник: DeFiLlama.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Сколько протоколов вернуть, по умолчанию 20" },
+        chain: { type: "string", description: "Фильтр по сети, например 'Ethereum' (опционально)" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_protocol_tvl",
+    description:
+      "Подробные данные по одному DeFi-протоколу: TVL по сетям, описание, ссылки. slug берётся из DeFiLlama (например 'aave', 'uniswap').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        slug: { type: "string", description: "DeFiLlama slug протокола, напр. 'aave'" },
+      },
+      required: ["slug"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_chain_tvl",
+    description:
+      "TVL по блокчейн-сетям (Ethereum, Solana, Base и т.д.), отсортировано по убыванию. Источник: DeFiLlama.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Сколько сетей вернуть, по умолчанию 20" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_stablecoins",
+    description:
+      "Топ стейблкоинов по циркулирующему предложению (USDT, USDC и т.д.) с ценой и типом обеспечения. Источник: DeFiLlama.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Сколько стейблкоинов вернуть, по умолчанию 15" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_yield_pools",
+    description:
+      "Топ yield-пулов (депозит/стейкинг/LP) по APY с TVL, категорией риска и разбивкой на base/reward APY. Только чтение — без исполнения транзакций. Источник: DeFiLlama.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Сколько пулов вернуть, по умолчанию 20" },
+        chain: { type: "string", description: "Фильтр по сети, например 'Ethereum' (опционально)" },
+        project: { type: "string", description: "Фильтр по названию протокола, например 'aave' (опционально)" },
+        min_tvl_usd: { type: "number", description: "Минимальный TVL пула в USD, чтобы отсеять мелкие/рискованные пулы (опционально)" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_dex_networks",
+    description:
+      "Список поддерживаемых блокчейн-сетей для DEX-данных (для использования в других dex-инструментах). Источник: DexPaprika.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "get_network_top_pools",
+    description:
+      "Топ ликвидных пулов на конкретной сети (например Ethereum, Solana) по объёму или ликвидности. Источник: DexPaprika.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        network: { type: "string", description: "Идентификатор сети, напр. 'ethereum', 'solana' (см. get_dex_networks)" },
+        limit: { type: "number", description: "Сколько пулов вернуть, по умолчанию 10" },
+        order_by: { type: "string", description: "Поле сортировки, по умолчанию 'volume_usd'" },
+      },
+      required: ["network"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "get_token_info",
+    description:
+      "Актуальные данные по токену на конкретной сети: цена, ликвидность, FDV, объём за 24ч. Источник: DexPaprika.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        network: { type: "string", description: "Идентификатор сети, напр. 'ethereum', 'solana'" },
+        token_address: { type: "string", description: "Адрес контракта токена в этой сети" },
+      },
+      required: ["network", "token_address"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "search_dex",
+    description:
+      "Поиск токенов и пулов по названию/тикеру across всех поддерживаемых сетей. Источник: DexPaprika.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Название или тикер для поиска" },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
 ];
 
 
@@ -358,6 +649,24 @@ export async function callTool(name, args = {}) {
       return await getMarketMovers(args);
     case "get_traditional_markets":
       return await getTraditionalMarkets();
+    case "get_defi_protocols":
+      return await getDefiProtocols(args);
+    case "get_protocol_tvl":
+      return await getProtocolTvl(args);
+    case "get_chain_tvl":
+      return await getChainTvl(args);
+    case "get_stablecoins":
+      return await getStablecoins(args);
+    case "get_yield_pools":
+      return await getYieldPools(args);
+    case "get_dex_networks":
+      return await getDexNetworks();
+    case "get_network_top_pools":
+      return await getNetworkTopPools(args);
+    case "get_token_info":
+      return await getTokenInfo(args);
+    case "search_dex":
+      return await searchDex(args);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
