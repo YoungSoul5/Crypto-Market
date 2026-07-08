@@ -2,21 +2,18 @@
 /**
  * Crypto Market MCP Server — HTTP entry point (для деплоя в облако).
  *
- * Позволяет подключить этот сервер как удалённый (remote) MCP-коннектор в
- * Claude — то есть он будет виден и в Cowork, и в claude.ai, и в Claude Code,
- * а не только в среде, где локально запущен процесс.
- *
  * Использует stateless-режим Streamable HTTP: каждый запрос обрабатывается
- * независимо, без хранения сессий — это подходит нашим read-only
- * инструментам и упрощает деплой (не нужен sticky routing/хранилище сессий).
+ * независимо, без хранения сессий.
  *
- * Авторизация: простой Bearer-токен через переменную окружения MCP_AUTH_TOKEN.
- * Если переменная не задана, сервер стартует БЕЗ авторизации — удобно для
- * локальной проверки, но для деплоя в интернет обязательно задайте токен.
+ * Авторизация: интерфейс custom connector в Claude на момент написания не
+ * поддерживает статичные Bearer-токены (только OAuth или её отсутствие).
+ * Полноценный OAuth избыточен для сервера, который отдаёт только публичные
+ * рыночные данные без побочных эффектов. Вместо токена используется
+ * простой rate limiting по IP — защита от злоупотребления, а не от доступа
+ * как такового.
  */
 
 import express from "express";
-import { randomUUID } from "node:crypto";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
@@ -26,7 +23,31 @@ import {
 import { TOOLS, callTool } from "./tools.js";
 
 const PORT = process.env.PORT || 3000;
-const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || null;
+
+// -------------------- Простой rate limiter (без внешних зависимостей) --------------------
+
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 минута
+const RATE_LIMIT_MAX_REQUESTS = 30; // запросов в минуту с одного IP
+const requestLog = new Map(); // ip -> [timestamps]
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const timestamps = (requestLog.get(ip) || []).filter(
+    (t) => now - t < RATE_LIMIT_WINDOW_MS
+  );
+  timestamps.push(now);
+  requestLog.set(ip, timestamps);
+  return timestamps.length > RATE_LIMIT_MAX_REQUESTS;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, timestamps] of requestLog.entries()) {
+    const fresh = timestamps.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+    if (fresh.length === 0) requestLog.delete(ip);
+    else requestLog.set(ip, fresh);
+  }
+}, RATE_LIMIT_WINDOW_MS).unref();
 
 function createServer() {
   const server = new Server(
@@ -62,20 +83,13 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", server: "crypto-market-mcp", version: "1.1.0" });
 });
 
-function checkAuth(req, res) {
-  if (!AUTH_TOKEN) return true; // авторизация выключена
-  const header = req.headers["authorization"] || "";
-  const expected = `Bearer ${AUTH_TOKEN}`;
-  if (header !== expected) {
-    res.status(401).json({ error: "Unauthorized: missing or invalid Bearer token" });
-    return false;
-  }
-  return true;
-}
-
 // Основной MCP-эндпоинт (stateless streamable HTTP)
 app.post("/mcp", async (req, res) => {
-  if (!checkAuth(req, res)) return;
+  const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.ip;
+  if (isRateLimited(ip)) {
+    res.status(429).json({ error: "Too many requests, slow down." });
+    return;
+  }
   try {
     const server = createServer();
     const transport = new StreamableHTTPServerTransport({
@@ -111,5 +125,5 @@ app.listen(PORT, () => {
   console.log(`crypto-market-mcp HTTP server listening on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
   console.log(`MCP endpoint: http://localhost:${PORT}/mcp`);
-  console.log(`Auth: ${AUTH_TOKEN ? "enabled (Bearer token required)" : "DISABLED — set MCP_AUTH_TOKEN for production"}`);
+  console.log(`Auth: none (public read-only data) — rate limited to ${RATE_LIMIT_MAX_REQUESTS} req/min per IP`);
 });
