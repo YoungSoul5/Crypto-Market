@@ -1,15 +1,15 @@
 {
   "name": "crypto-market-mcp",
   "version": "1.2.0",
-  "description": "MCP-сервер с данными крипторынка (CoinGecko, Fear & Greed Index), DeFi (DeFiLlama), DEX (DexPaprika) и традиционных финансов (Yahoo Finance) без необходимости в API-ключах. Поддерживает stdio (локально, Claude Code) и HTTP (облако, Cowork/claude.ai/Claude Code) транспорты.",
+  "description": "MCP-сервер с данными крипторынка (CoinGecko, Fear & Greed Index), DeFi (DeFiLlama), DEX (DexPaprika) и традиционных финансов (Yahoo Finance) без необходимости в API-ключах.",
   "type": "module",
-  "main": "src/index.js",
+  "main": "index.js",
   "bin": {
-    "crypto-market-mcp": "src/index.js"
+    "crypto-market-mcp": "index.js"
   },
   "scripts": {
-    "start": "node src/index.js",
-    "start:http": "node src/http.js"
+    "start": "node index.js",
+    "start:http": "node http.js"
   },
   "engines": {
     "node": ">=18"
